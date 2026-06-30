@@ -27,6 +27,28 @@ def validate_hyper_path(hyper_path: str | Path) -> Path:
     return path
 
 
+def normalize_table_name(table_name: str) -> str:
+    """
+    Swagger /docs나 JSON 응답에서 복사한 테이블명에
+    역슬래시나 바깥쪽 따옴표가 섞여 들어온 경우를 정리합니다.
+
+    예:
+    \\"Extract\\".\\"Orders\\" -> "Extract"."Orders"
+    "\\"Extract\\".\\"Orders\\"" -> "Extract"."Orders"
+    """
+    cleaned = table_name.strip()
+
+    # JSON escape 형태로 들어온 따옴표를 일반 따옴표로 변경
+    cleaned = cleaned.replace('\\"', '"')
+
+    # 바깥쪽에 따옴표가 한 겹 더 붙은 경우 제거
+    # 예: ""Extract"."Orders"" -> "Extract"."Orders"
+    while cleaned.startswith('""') and cleaned.endswith('""'):
+        cleaned = cleaned[1:-1]
+
+    return cleaned
+
+
 def list_tables(hyper_path: str | Path) -> list[str]:
     """
     .hyper 파일 안에 들어 있는 테이블 목록을 반환합니다.
@@ -54,14 +76,23 @@ def list_tables(hyper_path: str | Path) -> list[str]:
     return tables
 
 
-def assert_known_table(hyper_path: str | Path, table_name: str) -> None:
+def assert_known_table(hyper_path: str | Path, table_name: str) -> str:
     """
     사용자가 입력한 table_name이 실제 Hyper 파일 안에 있는 테이블인지 확인합니다.
+    정상 테이블이면 정리된 table_name을 반환합니다.
     """
+    cleaned_table_name = normalize_table_name(table_name)
     tables = list_tables(hyper_path)
 
-    if table_name not in tables:
-        raise ValueError(f"존재하지 않는 테이블입니다: {table_name}")
+    if cleaned_table_name not in tables:
+        raise ValueError(
+            "존재하지 않는 테이블입니다. "
+            f"입력값: {table_name}, "
+            f"정리된 값: {cleaned_table_name}, "
+            f"사용 가능한 테이블: {tables}"
+        )
+
+    return cleaned_table_name
 
 
 def get_table_schema(hyper_path: str | Path, table_name: str) -> list[dict[str, Any]]:
@@ -69,7 +100,7 @@ def get_table_schema(hyper_path: str | Path, table_name: str) -> list[dict[str, 
     특정 테이블의 컬럼명과 데이터 타입을 반환합니다.
     """
     path = validate_hyper_path(hyper_path)
-    assert_known_table(path, table_name)
+    table_name = assert_known_table(path, table_name)
 
     query = f"SELECT * FROM {table_name} LIMIT 0"
 
@@ -97,7 +128,7 @@ def get_row_count(hyper_path: str | Path, table_name: str) -> int:
     특정 테이블의 전체 행 수를 반환합니다.
     """
     path = validate_hyper_path(hyper_path)
-    assert_known_table(path, table_name)
+    table_name = assert_known_table(path, table_name)
 
     query = f"SELECT COUNT(*) FROM {table_name}"
 
@@ -130,7 +161,7 @@ def preview_table(
     특정 테이블의 상위 N행을 pandas DataFrame으로 반환합니다.
     """
     path = validate_hyper_path(hyper_path)
-    assert_known_table(path, table_name)
+    table_name = assert_known_table(path, table_name)
 
     if limit < 1:
         raise ValueError("limit은 1 이상이어야 합니다.")

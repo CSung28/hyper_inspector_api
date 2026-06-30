@@ -7,7 +7,7 @@ from typing import Any
 from tableauhyperapi import Connection, CreateMode, HyperProcess, Telemetry
 
 from app.services.hyper_reader import APP_NAME, assert_known_table, get_table_schema, validate_hyper_path
-from app.services.sql_builder import date_literal, safe_column_name, safe_table_name
+from app.services.sql_builder import assert_select_only, build_plan_sql, date_literal, safe_column_name, safe_table_name
 
 
 def _json_safe(value: Any):
@@ -239,4 +239,138 @@ def month_over_month(
         "latest_month_value": latest_value,
         "previous_month_value": previous_value,
         "change_rate": change_rate,
+    }
+
+
+def _schema_columns(hyper_path: str | Path, table_name: str) -> list[str]:
+    return [column["column_name"] for column in get_table_schema(hyper_path, table_name)]
+
+
+def _fetch_rows(connection: Connection, sql: str) -> list[list[Any]]:
+    sql = assert_select_only(sql)
+    with connection.execute_query(sql) as result:
+        return [[_json_safe(value) for value in row] for row in result]
+
+
+def _as_number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    return float(value)
+
+
+def _anchor_date(connection: Connection, table_sql: str, date_column_sql: str) -> date:
+    max_sql = assert_select_only(f"SELECT MAX({date_column_sql}) FROM {table_sql}")
+    max_value = connection.execute_scalar_query(max_sql)
+    if max_value is None:
+        raise ValueError("날짜 컬럼의 MAX 값을 찾을 수 없습니다.")
+    return _as_date(max_value)
+
+
+def execute_query_plan(hyper_path: str | Path, plan: dict[str, Any]) -> dict[str, Any]:
+    path = validate_hyper_path(hyper_path)
+    table_name = assert_known_table(path, plan["table"])
+    allowed_columns = _schema_columns(path, table_name)
+    table_sql = safe_table_name(table_name)
+    intent = plan["intent"]
+
+    with _connect(path) as hyper:
+        with Connection(hyper.endpoint, str(path), CreateMode.NONE) as connection:
+            if intent == "month_over_month":
+                date_col = safe_column_name(plan["date_column"], allowed_columns)
+                measure_col = safe_column_name(plan["measure_column"], allowed_columns)
+                anchor = _anchor_date(connection, table_sql, date_col.sql)
+                latest_month = _month_start(anchor)
+                previous_month = _add_months(latest_month, -1)
+                next_month = _add_months(latest_month, 1)
+                executed_sql = assert_select_only(
+                    f"SELECT DATE_TRUNC('month', {date_col.sql}) AS month, "
+                    f"SUM({measure_col.sql}) AS value, COUNT(*) AS rows_used "
+                    f"FROM {table_sql} "
+                    f"WHERE {date_col.sql} >= {date_literal(previous_month)} "
+                    f"AND {date_col.sql} < {date_literal(next_month)} "
+                    f"GROUP BY DATE_TRUNC('month', {date_col.sql}) "
+                    f"ORDER BY month ASC"
+                )
+                rows = [
+                    {"month": row[0], "value": row[1] or 0, "rows_used": row[2] or 0}
+                    for row in _fetch_rows(connection, executed_sql)
+                ]
+                previous = rows[0] if rows else {"value": 0, "rows_used": 0, "month": previous_month.isoformat()}
+                latest = rows[-1] if len(rows) > 1 else {"value": 0, "rows_used": 0, "month": latest_month.isoformat()}
+                previous_value = _as_number(previous["value"])
+                latest_value = _as_number(latest["value"])
+                change_amount = latest_value - previous_value
+                change_rate = (change_amount / previous_value) if previous_value else None
+                return {
+                    "value": change_rate,
+                    "period_start": previous.get("month"),
+                    "period_end": latest.get("month"),
+                    "rows_used": (previous.get("rows_used") or 0) + (latest.get("rows_used") or 0),
+                    "executed_sql": executed_sql,
+                    "rows": rows,
+                    "previous_month_value": previous_value,
+                    "latest_month_value": latest_value,
+                    "change_amount": change_amount,
+                    "change_rate": change_rate,
+                }
+
+            anchor = None
+            if intent == "recent_period_sum":
+                date_col = safe_column_name(plan["date_column"], allowed_columns)
+                anchor = _anchor_date(connection, table_sql, date_col.sql)
+
+            executed_sql, meta = build_plan_sql(plan, allowed_columns, anchor)
+            rows = _fetch_rows(connection, executed_sql)
+
+    if intent == "monthly_trend":
+        trend_rows = [{"month": row[0], "value": row[1] or 0, "rows_used": row[2] or 0} for row in rows]
+        return {
+            "value": trend_rows[-1]["value"] if trend_rows else 0,
+            "period_start": trend_rows[0]["month"] if trend_rows else None,
+            "period_end": trend_rows[-1]["month"] if trend_rows else None,
+            "rows_used": sum(row["rows_used"] for row in trend_rows),
+            "executed_sql": executed_sql,
+            "rows": trend_rows,
+        }
+
+    if intent == "top_n_by_dimension":
+        top_rows = [{"dimension_value": row[0], "value": row[1] or 0, "rows_used": row[2] or 0} for row in rows]
+        return {
+            "value": top_rows[0]["value"] if top_rows else 0,
+            "period_start": None,
+            "period_end": None,
+            "rows_used": sum(row["rows_used"] for row in top_rows),
+            "executed_sql": executed_sql,
+            "rows": top_rows,
+        }
+
+    if intent == "min_max_date":
+        row = rows[0] if rows else [None, None, 0]
+        return {
+            "value": row[1],
+            "period_start": row[0],
+            "period_end": row[1],
+            "rows_used": row[2],
+            "executed_sql": executed_sql,
+        }
+
+    row = rows[0] if rows else [0, 0]
+    if intent == "row_count":
+        return {
+            "value": row[0] or 0,
+            "rows_used": row[0] or 0,
+            "period_start": None,
+            "period_end": None,
+            "executed_sql": executed_sql,
+            "answer": f"테이블 행 수는 {row[0] or 0:,}건입니다.",
+            "metric": "row_count",
+        }
+
+    return {
+        "value": row[0] or 0,
+        "rows_used": row[1] if len(row) > 1 else None,
+        "period_start": meta.get("period_start").isoformat() if meta.get("period_start") else None,
+        "period_end": meta.get("period_end").isoformat() if meta.get("period_end") else None,
+        "executed_sql": executed_sql,
+        "metric": plan.get("measure_column") or plan.get("dimension_column") or intent,
     }
